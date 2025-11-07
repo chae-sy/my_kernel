@@ -1,7 +1,7 @@
 #include <cuda_fp16.h>     
 #include <cuda_runtime.h>  
 #include <stdio.h>  
-#include "kernel.cu"
+#include "kernel.h"
 
 int main(){
     int m = 3;
