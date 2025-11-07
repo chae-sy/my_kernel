@@ -11,7 +11,6 @@
 #include <random>
 #include <chrono>
 #include <math.h>
-#include <chrono>
 
 #include "kernel.h"
 
@@ -21,6 +20,41 @@
 
 #define WARMUP_REPS 50
 #define REPS        100
+
+void check_cublas(cublasStatus_t stat, const char* const func,
+                  const char* const file, const int line) {
+    if (stat != CUBLAS_STATUS_SUCCESS) {
+        const char* err_str = nullptr;
+        switch (stat) {
+            case CUBLAS_STATUS_NOT_INITIALIZED:
+                err_str = "CUBLAS_STATUS_NOT_INITIALIZED"; break;
+            case CUBLAS_STATUS_ALLOC_FAILED:
+                err_str = "CUBLAS_STATUS_ALLOC_FAILED"; break;
+            case CUBLAS_STATUS_INVALID_VALUE:
+                err_str = "CUBLAS_STATUS_INVALID_VALUE"; break;
+            case CUBLAS_STATUS_ARCH_MISMATCH:
+                err_str = "CUBLAS_STATUS_ARCH_MISMATCH"; break;
+            case CUBLAS_STATUS_MAPPING_ERROR:
+                err_str = "CUBLAS_STATUS_MAPPING_ERROR"; break;
+            case CUBLAS_STATUS_EXECUTION_FAILED:
+                err_str = "CUBLAS_STATUS_EXECUTION_FAILED"; break;
+            case CUBLAS_STATUS_INTERNAL_ERROR:
+                err_str = "CUBLAS_STATUS_INTERNAL_ERROR"; break;
+            default:
+                err_str = "Unknown cuBLAS error"; break;
+        }
+
+        fprintf(stderr,
+                "cuBLAS error at %s:%d\n"
+                "    -> Function: %s\n"
+                "    -> Error: %s (%d)\n",
+                file, line, func, err_str, static_cast<int>(stat));
+        exit(EXIT_FAILURE);
+    }
+}
+
+#define CHECK_CUBLAS(val) check_cublas((val), #val, __FILE__, __LINE__)
+
 
 void check_cuda(cudaError_t err, const char* const func, const char* const file,
                 const int line) {
@@ -88,36 +122,30 @@ void gemm_cpu(const half *A, const half *B, half *C,
 }
 
 // cublas launcher
-static inline void launch_cublas_kernel(half *dA, half *dB, half *dC,
-                                     int m, int n, int k) {
-  cublasHandle_t h;
-  cublasCreate(&h);
-  float alpha = 1.f, beta = 0.f;
-
-  cublasStatus_t st = cublasGemmEx(
+static inline void launch_cublas_kernel(
+    cublasHandle_t h, half *dA, half *dB, half *dC,
+    int m, int n, int k) {
+  const float alpha = 1.f, beta = 0.f;
+  CHECK_CUBLAS(cublasGemmEx(
       h,
       CUBLAS_OP_T, CUBLAS_OP_T,
       n, m, k,
       &alpha,
-      dB, CUDA_R_16F, n,   // FP16 A := B^T, (N, K) -> lda = n
-      dA, CUDA_R_16F, k,   // FP16 B := A^T, (K, M) -> ldb = k
+      dB, CUDA_R_16F, n,
+      dA, CUDA_R_16F, k,
       &beta,
-      dC, CUDA_R_16F, n,   // FP16 C := C^T, (N, M) -> ldc = n
-      CUBLAS_COMPUTE_32F, // FP32 Accmulation
-      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-  if (st != CUBLAS_STATUS_SUCCESS) {
-    fprintf(stderr, "cublasGemmEx failed: %d\n", (int)st);
-    exit(1);
-  }
-  cublasDestroy(h);
+      dC, CUDA_R_16F, n,
+      CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT_TENSOR_OP));
 }
+
 
 // kernel launcher
 static inline void launch_custom_kernel(
     int kernelNum, dim3 grid, dim3 block,
-    const half *A, const half *B, half *C, int m, int n, int k) {
+    const half *A, const half *B, half *C, int m, int n, int k, cudaStream_t stream) {
   switch (kernelNum) {
-    case 01: matmul_0_1<<<grid, block>>>(A, B, C, m, n, k); break;
+    case 1: matmul_0_1<<<grid, block, 0, stream>>>(A, B, C, m, n, k); break;
     //case 11: mma_matmul_1_1<<<grid, block>>>(A, B_colmajor, C, M, N, K); break;
     //case 20: mma_matmul_2_0<<<grid, block>>>(A, B_colmajor, C, M, N, K); break;
     //case 21: mma_matmul_2_1<<<grid, block>>>(A, B_colmajor, C, M, N, K); break;
@@ -168,11 +196,11 @@ static inline float time_kernel_ms(std::function<T(cudaStream_t)> bound_function
 int main(int argc, char **argv){
     if (argc != 2) {
     printf("Usage: ./runner <kernelNum>\n");
-    printf("Valid: 01,1,10,11,20,21,30,31,32,33,34\n");
+    printf("Valid: 1,10,11,20,21,30,31,32,33,34\n");
     return 0;
   }
     int kernelNum = atoi(argv[1]);
-  const int valid[11] = {01,1,10,11,20,21,30,31,32,33,34};
+  const int valid[11] = {1,10,11,20,21,30,31,32,33,34};
   if (!in_array(kernelNum, valid, 11)) {
     printf("Invalid kernel.\n"); return 0;
   }
@@ -200,9 +228,10 @@ int main(int argc, char **argv){
 
     dim3 block(16, 16); 
     dim3 grid(ceilDiv(N, block.x) , ceilDiv(M, block.y)); 
-    
-    launch_custom_kernel(kernelNum, grid, block, dA, dB, dC, M, N, K);
-
+    cudaStream_t stream;
+CHECK_CUDA_ERROR(cudaStreamCreate(&stream));
+    launch_custom_kernel(kernelNum, grid, block, dA, dB, dC, M, N, K, stream);
+CHECK_CUDA_ERROR(cudaStreamDestroy(stream));
     cudaDeviceSynchronize(); // GPU 연산이 모두 끝날 때까지 기다리기
 
     cudaMemcpy(hC, dC, M*N*sizeof(half), cudaMemcpyDeviceToHost);
@@ -236,22 +265,26 @@ int main(int argc, char **argv){
     // };
     // float t_cublas = time_kernel_ms(fn_cublas, WARMUP_REPS, REPS);
     // float t_custom    = time_kernel_ms(fn_custom, WARMUP_REPS, REPS);
-    cudaStream_t stream;
-    cudaStreamCreate(&stream);
-    // Launch cuBLAS GEMM.
-    float const t_cublas = time_kernel_ms<void>(
-    [&](cudaStream_t stream)
-    {
-        launch_cublas_kernel(dA, dB, dC_cublas, M, N, K);
-    },
-    stream, REPS, WARMUP_REPS);
+    cudaStream_t stream2;
+CHECK_CUDA_ERROR(cudaStreamCreate(&stream2));
+cublasHandle_t handle;
+CHECK_CUBLAS(cublasCreate(&handle));
+CHECK_CUBLAS(cublasSetStream(handle, stream2));
+float const t_cublas = time_kernel_ms<void>(
+  [&](cudaStream_t s){
+    // 여기서는 핸들 재사용. 절대 DeviceSynchronize() 넣지 마!
+    launch_cublas_kernel(handle, dA, dB, dC_cublas, M, N, K);
+    CHECK_CUDA_ERROR(cudaPeekAtLastError());
+  }, stream2, WARMUP_REPS, REPS);
 
-    float const t_custom = time_kernel_ms<void>(
-    [&](cudaStream_t stream)
-    {
-        launch_custom_kernel(kernelNum, grid, block, dA, dB, dC_custom, M, N, K);
-    },
-    stream, REPS, WARMUP_REPS);
+float const t_custom = time_kernel_ms<void>(
+  [&](cudaStream_t s){
+    launch_custom_kernel(kernelNum, grid, block, dA, dB, dC_custom, M, N, K, s);
+    CHECK_CUDA_ERROR(cudaPeekAtLastError());
+  }, stream2, WARMUP_REPS, REPS);
+
+CHECK_CUDA_ERROR(cudaStreamDestroy(stream2));
+
 
 
 
