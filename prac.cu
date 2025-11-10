@@ -1,50 +1,66 @@
-#include <cuda_fp16.h>     
-#include <cuda_runtime.h> 
-#include <iostream>
-#include <mma.h>
+#include <cuda_fp16.h>
 #include <cstdio>
 
-using namespace nvcuda;
+// --- 1. MMA intrinsic 정의 -----------------------------------------------
+__device__ void mma_m16n8k16_f16( // C16×8​ = A16×16 ​× B16×8​ + C16×8​
+    // Warp(32 threads) 가 협력해서 한 타일을 계산하고,
+    // 각 스레드가 A, B, C, D 행렬의 “조각(fragment)”만을 맡아.
+    float D[4], const half A[8], const half B[4], const float C[4]) {
 
-__global__ void mma_fp16_fp32(float *C, half *A, half *B) {
-    // Tile 크기: m16n16k16 (16x16 행렬 블록)
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag; // C16×16​=A16×16​×B16×16​, row major
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag; // col major
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag; // fp32
+    // half → 16bit pattern reinterpret
+    const unsigned short *A_s = reinterpret_cast<const unsigned short *>(A);
+    const unsigned short *B_s = reinterpret_cast<const unsigned short *>(B);
 
-    // C를 0으로 초기화
-    wmma::fill_fragment(c_frag, 0.0f);
+    // 16bit * 2 = 32bit씩 묶기 (PTX는 32bit register 단위만 받음)
+    unsigned A_pack[4], B_pack[2];
+    for (int i = 0; i < 4; ++i)
+        A_pack[i] = (A_s[2*i+1] << 16) | A_s[2*i];
+    for (int i = 0; i < 2; ++i)
+        B_pack[i] = (B_s[2*i+1] << 16) | B_s[2*i];
 
-    // A, B를 global memory에서 fragment로 load
-    wmma::load_matrix_sync(a_frag, A, 16); // 16: leading dimension(=stride).
-    wmma::load_matrix_sync(b_frag, B, 16); // 16: B는 col_major로 읽으므로, 여기서 16은 열의 길이(행 수).
-
-    // MMA 연산 수행 (FP16 × FP16 → FP32 누적)
-    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag); // C←A×B+C
-    // 중요: warp(32 threads) 단위로 실행되며, m16n16k16 타일 하나를 한 번에 곱-누적.
-
-    // 결과를 global memory에 저장
-    wmma::store_matrix_sync(C, c_frag, 16, wmma::mem_row_major); // 16: 결과 C를 row_major로 저장할 때의 leading dimension(행의 길이=열 수).
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%10, %11, %12, %13};\n"
+        : "=f"(D[0]), "=f"(D[1]), "=f"(D[2]), "=f"(D[3])
+        : "r"(A_pack[0]), "r"(A_pack[1]), "r"(A_pack[2]), "r"(A_pack[3]),
+          "r"(B_pack[0]), "r"(B_pack[1]),
+          "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3])
+    );
 }
 
+// --- 2. 간단한 커널 -------------------------------------------------------
+__global__ void test_mma_kernel(float *out) {
+    // 각 warp는 16×8×16 타일 하나를 수행한다고 가정
+    float D[4], C[4];
+    half  A[8], B[4];
 
+    // 초기화: A, B 전부 1.0, C는 0.0
+    for (int i = 0; i < 8; ++i)  A[i] = __float2half(1.0f);
+    for (int i = 0; i < 4; ++i)  B[i] = __float2half(1.0f);
+    for (int i = 0; i < 4; ++i)  C[i] = 0.0f;
+
+    mma_m16n8k16_f16(D, A, B, C);
+
+    // 결과 저장 (warp 0의 thread 0만 기록)
+    if (threadIdx.x == 0)
+        for (int i = 0; i < 4; ++i)
+            out[i] = __float2half(D[i]); // fp32 누적, fp16으로 변환 
+}
+
+// --- 3. main --------------------------------------------------------------
 int main() {
-    half *A, *B;
-    float *C;
-    cudaMallocManaged(&A, sizeof(half) * 16 * 16);
-    cudaMallocManaged(&B, sizeof(half) * 16 * 16);
-    cudaMallocManaged(&C, sizeof(float) * 16 * 16);
+    float *d_out, h_out[4];
+    cudaMalloc(&d_out, sizeof(float) * 4);
 
-    // 값 초기화
-    for (int i = 0; i < 16*16; i++) {
-        A[i] = __float2half(1.0f);
-        B[i] = __float2half(1.0f);
-        C[i] = 0.0f;
-    }
+    test_mma_kernel<<<1, 32>>>(d_out);
+    cudaMemcpy(h_out, d_out, sizeof(float) * 4, cudaMemcpyDeviceToHost);
 
-    mma_fp16_fp32<<<1, 32>>>(C, A, B); // (1, 16) x (16, 1) = (1, 1)
-    cudaDeviceSynchronize();
+    for (int i = 0; i < 4; ++i)
+        printf("D[%d] = %f\n", i, h_out[i]);
 
-    printf("C[0] = %f\n", C[0]);
+    cudaFree(d_out);
     return 0;
 }
