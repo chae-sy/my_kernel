@@ -32,7 +32,7 @@ __device__ void mma_m16n8k16_f16( // C16×8​ = A16×16 ​× B16×8​ + C16×
 }
 
 // --- 2. 간단한 커널 -------------------------------------------------------
-__global__ void test_mma_kernel(float *out) {
+__global__ void test_mma_kernel(half *out) {
     // 각 warp는 16×8×16 타일 하나를 수행한다고 가정
     float D[4], C[4];
     half  A[8], B[4];
@@ -52,14 +52,14 @@ __global__ void test_mma_kernel(float *out) {
 
 // --- 3. main --------------------------------------------------------------
 int main() {
-    float *d_out, h_out[4];
-    cudaMalloc(&d_out, sizeof(float) * 4);
+    half *d_out, h_out[4];
+    cudaMalloc(&d_out, sizeof(half) * 4);
 
     test_mma_kernel<<<1, 32>>>(d_out);
-    cudaMemcpy(h_out, d_out, sizeof(float) * 4, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_out, d_out, sizeof(half) * 4, cudaMemcpyDeviceToHost);
 
     for (int i = 0; i < 4; ++i)
-        printf("D[%d] = %f\n", i, h_out[i]);
+        printf("D[%d] = %f\n", i, __half2float(h_out[i]));
 
     cudaFree(d_out);
     return 0;
