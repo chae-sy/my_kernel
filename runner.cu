@@ -260,19 +260,38 @@ int main(int argc, char **argv){
     cudaMemcpy(dB, hB, K * N * sizeof(half), cudaMemcpyHostToDevice);
 
     // runner.cu main() 내부, 런치 파라미터 분기
+constexpr int M_TILE = 2;
+constexpr int N_TILE = 2;
+
 dim3 block_basic(16, 16);
 dim3 grid_basic(ceilDiv(N, block_basic.x), ceilDiv(M, block_basic.y));
 
-dim3 block_mma(32);         // 1 warp
-dim3 grid_mma(N/8, M/16);   // 16x8 타일
+dim3 block_mma(32);         // 1 warp (for kernel 10)
+dim3 grid_mma(N / 8, M / 16);
+
+dim3 block_mma_tiled(16, 16); // for kernel 11 (2x2 tiling)
+dim3 grid_mma_tiled(
+    (N + N_TILE * 32 - 1) / (N_TILE * 32),
+    (M + M_TILE * 32 - 1) / (M_TILE * 32)
+);
+
 
 cudaStream_t stream;
 CHECK_CUDA_ERROR(cudaStreamCreate(&stream));
 
+
+
 if (kernelNum == 1) {
-  launch_custom_kernel(kernelNum, grid_basic, block_basic, dA, dB, dC, M, N, K, stream);
-} else { // 10, 11 ...
-  launch_custom_kernel(kernelNum, grid_mma, block_mma, dA, dB, dC, M, N, K, stream);
+  launch_custom_kernel(kernelNum, grid_basic, block_basic,
+                       dA, dB, dC, M, N, K, stream);
+
+} else if (kernelNum == 10) {
+  launch_custom_kernel(kernelNum, grid_mma, block_mma,
+                       dA, dB, dC, M, N, K, stream);
+
+} else if (kernelNum == 11) {
+  launch_custom_kernel(kernelNum, grid_mma_tiled, block_mma_tiled,
+                       dA, dB, dC, M, N, K, stream);
 }
 
 CHECK_CUDA_ERROR(cudaStreamDestroy(stream));
@@ -324,11 +343,16 @@ float const t_cublas = time_kernel_ms<void>(
 
 float const t_custom = time_kernel_ms<void>(
   [&](cudaStream_t s) {
-    // kernelNum에 따라 grid/block 자동 선택
-    if (kernelNum == 1)
-      launch_custom_kernel(kernelNum, grid_basic, block_basic, dA, dB, dC_custom, M, N, K, s);
-    else
-      launch_custom_kernel(kernelNum, grid_mma, block_mma, dA, dB, dC_custom, M, N, K, s);
+    if (kernelNum == 1) {
+      launch_custom_kernel(kernelNum, grid_basic, block_basic,
+                           dA, dB, dC_custom, M, N, K, s);
+    } else if (kernelNum == 10) {
+      launch_custom_kernel(kernelNum, grid_mma, block_mma,
+                           dA, dB, dC_custom, M, N, K, s);
+    } else if (kernelNum == 11) {
+      launch_custom_kernel(kernelNum, grid_mma_tiled, block_mma_tiled,
+                           dA, dB, dC_custom, M, N, K, s);
+    }
 
     CHECK_CUDA_ERROR(cudaPeekAtLastError());
   },
@@ -336,7 +360,6 @@ float const t_custom = time_kernel_ms<void>(
   WARMUP_REPS,
   REPS
 );
-
 
 CHECK_CUDA_ERROR(cudaStreamDestroy(stream2));
 
