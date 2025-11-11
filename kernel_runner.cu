@@ -180,13 +180,13 @@ static inline void launch_custom_kernel(
     case 1: matmul_0_1<<<grid, block, 0, stream>>>(A, B, C, m, n, k); break;
     case 10: mma_matmul_1_0<<<grid, block>>>(A, B, C, m, n, k); break;
     case 11: mma_matmul_1_1<<<grid, block>>>(A, B, C, m, n, k); break;
-    //case 20: mma_matmul_2_0<<<grid, block>>>(A, B_colmajor, C, M, N, K); break;
-    //case 21: mma_matmul_2_1<<<grid, block>>>(A, B_colmajor, C, M, N, K); break;
-    //case 30: mma_matmul_3_0<<<grid, block>>>(A, B_colmajor, C, M, N, K); break;
-    //case 31: mma_matmul_3_1<<<grid, block>>>(A, B_colmajor, C, M, N, K); break;
-    //case 32: mma_matmul_3_2<<<grid, block>>>(A, B_colmajor, C, M, N, K); break;
-    //case 33: mma_matmul_3_3<<<grid, block>>>(A, B_colmajor, C, M, N, K); break;
-    //case 34: mma_matmul_3_4<<<grid, block>>>(A, B_colmajor, C, M, N, K); break;
+    case 20: mma_matmul_2_0<<<grid, block>>>(A, B, C, M, N, K); break;
+    case 21: mma_matmul_2_1<<<grid, block>>>(A, B, C, M, N, K); break;
+    //case 30: mma_matmul_3_0<<<grid, block>>>(A, B, C, M, N, K); break;
+    //case 31: mma_matmul_3_1<<<grid, block>>>(A, B, C, M, N, K); break;
+    //case 32: mma_matmul_3_2<<<grid, block>>>(A, B, C, M, N, K); break;
+    //case 33: mma_matmul_3_3<<<grid, block>>>(A, B, C, M, N, K); break;
+    //case 34: mma_matmul_3_4<<<grid, block>>>(A, B, C, M, N, K); break;
     default: break;
   }
 }
@@ -292,7 +292,13 @@ if (kernelNum == 1) {
 } else if (kernelNum == 11) {
   launch_custom_kernel(kernelNum, grid_mma_tiled, block_mma_tiled,
                        dA, dB, dC, M, N, K, stream);
+} else if (kernelNum == 20 || kernelNum == 21) {
+  dim3 block_mma_64(16, 16);
+  dim3 grid_mma_64(N / 64, M / 64);
+  launch_custom_kernel(kernelNum, grid_mma_64, block_mma_64,
+                       dA, dB, dC, M, N, K, stream);
 }
+
 
 CHECK_CUDA_ERROR(cudaStreamDestroy(stream));
 cudaDeviceSynchronize();
@@ -352,7 +358,13 @@ float const t_custom = time_kernel_ms<void>(
     } else if (kernelNum == 11) {
       launch_custom_kernel(kernelNum, grid_mma_tiled, block_mma_tiled,
                            dA, dB, dC_custom, M, N, K, s);
-    }
+    } else if (kernelNum == 20 || kernelNum == 21) {
+  dim3 block_mma_64(16, 16);
+  dim3 grid_mma_64(N / 64, M / 64);
+  launch_custom_kernel(kernelNum, grid_mma_64, block_mma_64,
+                       dA, dB, dC_custom, M, N, K, s);
+}
+
 
     CHECK_CUDA_ERROR(cudaPeekAtLastError());
   },
