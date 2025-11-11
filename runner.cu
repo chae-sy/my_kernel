@@ -90,7 +90,7 @@ static inline bool in_array(int val, const int *vals, int n) {
 }
 
 // N(0,1) 분포의 FP16 행렬을 row-major 형태로 초기화
-void random_init_matrix_half(half* A, size_t m, size_t n)
+void random_init_matrix_row_major_half(half* A, size_t m, size_t n)
 {
     std::default_random_engine eng(0U);
     std::normal_distribution<float> dis(0.0f, 1.0f); // N(0,1)
@@ -100,6 +100,21 @@ void random_init_matrix_half(half* A, size_t m, size_t n)
         for (size_t j=0; j < n; ++j)
         {
             A[i * n + j] = __float2half(randn());
+        }
+    }
+}
+
+// N(0,1) 분포의 FP16 행렬을 col-major 형태로 초기화
+void random_init_matrix_col_major_half(half* A, size_t m, size_t n)
+{
+    std::default_random_engine eng(0U);
+    std::normal_distribution<float> dis(0.0f, 1.0f); // N(0,1)
+    auto const randn = [&dis, &eng]() { return dis(eng); };
+    for (size_t i=0; i < m; ++i)
+    {
+        for (size_t j=0; j < n; ++j)
+        {
+            A[i + m * j] = __float2half(randn());
         }
     }
 }
@@ -121,6 +136,23 @@ void gemm_cpu(const half *A, const half *B, half *C,
     }
 }
 
+void gemm_cpu_B_colmajor(const half* A, const half* B, half* C,
+                         size_t m, size_t n, size_t k) {
+  for (size_t i=0; i<m; ++i) {
+    for (size_t j=0; j<n; ++j) {
+      float acc = 0.f;
+      for (size_t l=0; l<k; ++l) {
+        // A: row-major, B: col-major (rows=k, cols=n)
+        float a = __half2float(A[i*k + l]);
+        float b = __half2float(B[j*k + l]);  // ✅ col-major: j*k + l
+        acc += a * b;
+      }
+      C[i*n + j] = __float2half(acc);
+    }
+  }
+}
+
+
 // cublas launcher
 static inline void launch_cublas_kernel(
     cublasHandle_t h, half *dA, half *dB, half *dC,
@@ -128,7 +160,7 @@ static inline void launch_cublas_kernel(
   const float alpha = 1.f, beta = 0.f;
   CHECK_CUBLAS(cublasGemmEx(
       h,
-      CUBLAS_OP_T, CUBLAS_OP_T,
+      CUBLAS_OP_T, CUBLAS_OP_N,
       n, m, k,
       &alpha,
       dB, CUDA_R_16F, n,
@@ -146,7 +178,8 @@ static inline void launch_custom_kernel(
     const half *A, const half *B, half *C, int m, int n, int k, cudaStream_t stream) {
   switch (kernelNum) {
     case 1: matmul_0_1<<<grid, block, 0, stream>>>(A, B, C, m, n, k); break;
-    //case 11: mma_matmul_1_1<<<grid, block>>>(A, B_colmajor, C, M, N, K); break;
+    case 10: mma_matmul_1_0<<<grid, block>>>(A, B, C, m, n, k); break;
+    case 11: mma_matmul_1_1<<<grid, block>>>(A, B, C, m, n, k); break;
     //case 20: mma_matmul_2_0<<<grid, block>>>(A, B_colmajor, C, M, N, K); break;
     //case 21: mma_matmul_2_1<<<grid, block>>>(A, B_colmajor, C, M, N, K); break;
     //case 30: mma_matmul_3_0<<<grid, block>>>(A, B_colmajor, C, M, N, K); break;
@@ -219,24 +252,36 @@ int main(int argc, char **argv){
     cudaMalloc(&dC_cublas, M * N * sizeof(half));
     cudaMalloc(&dC_custom, M * N * sizeof(half));
 
-    random_init_matrix_half(hA, M, K);
-    random_init_matrix_half(hB, K, N);
+    random_init_matrix_row_major_half(hA, M, K);
+    random_init_matrix_col_major_half(hB, K, N);
 
     // accuracy check vs gemm cpu
     cudaMemcpy(dA, hA, M * K * sizeof(half), cudaMemcpyHostToDevice);
     cudaMemcpy(dB, hB, K * N * sizeof(half), cudaMemcpyHostToDevice);
 
-    dim3 block(16, 16); 
-    dim3 grid(ceilDiv(N, block.x) , ceilDiv(M, block.y)); 
-    cudaStream_t stream;
+    // runner.cu main() 내부, 런치 파라미터 분기
+dim3 block_basic(16, 16);
+dim3 grid_basic(ceilDiv(N, block_basic.x), ceilDiv(M, block_basic.y));
+
+dim3 block_mma(32);         // 1 warp
+dim3 grid_mma(N/8, M/16);   // 16x8 타일
+
+cudaStream_t stream;
 CHECK_CUDA_ERROR(cudaStreamCreate(&stream));
-    launch_custom_kernel(kernelNum, grid, block, dA, dB, dC, M, N, K, stream);
+
+if (kernelNum == 1) {
+  launch_custom_kernel(kernelNum, grid_basic, block_basic, dA, dB, dC, M, N, K, stream);
+} else { // 10, 11 ...
+  launch_custom_kernel(kernelNum, grid_mma, block_mma, dA, dB, dC, M, N, K, stream);
+}
+
 CHECK_CUDA_ERROR(cudaStreamDestroy(stream));
-    cudaDeviceSynchronize(); // GPU 연산이 모두 끝날 때까지 기다리기
+cudaDeviceSynchronize();
+
 
     cudaMemcpy(hC, dC, M*N*sizeof(half), cudaMemcpyDeviceToHost);
 
-    gemm_cpu(hA, hB, ref_C, M, N, K);
+    gemm_cpu_B_colmajor(hA, hB, ref_C, M, N, K);
     const double abs_tol = 5.0e-2, rel_tol = 2.0e-2;
     double avg_abs=0, avg_diff=0, max_abs=0, avg_out=0;
     int mismatch=0, total = M*N;
@@ -278,10 +323,20 @@ float const t_cublas = time_kernel_ms<void>(
   }, stream2, WARMUP_REPS, REPS);
 
 float const t_custom = time_kernel_ms<void>(
-  [&](cudaStream_t s){
-    launch_custom_kernel(kernelNum, grid, block, dA, dB, dC_custom, M, N, K, s);
+  [&](cudaStream_t s) {
+    // kernelNum에 따라 grid/block 자동 선택
+    if (kernelNum == 1)
+      launch_custom_kernel(kernelNum, grid_basic, block_basic, dA, dB, dC_custom, M, N, K, s);
+    else
+      launch_custom_kernel(kernelNum, grid_mma, block_mma, dA, dB, dC_custom, M, N, K, s);
+
     CHECK_CUDA_ERROR(cudaPeekAtLastError());
-  }, stream2, WARMUP_REPS, REPS);
+  },
+  stream2,
+  WARMUP_REPS,
+  REPS
+);
+
 
 CHECK_CUDA_ERROR(cudaStreamDestroy(stream2));
 
@@ -303,7 +358,7 @@ CHECK_CUDA_ERROR(cudaStreamDestroy(stream2));
     cudaFree(dB);
     cudaFree(dC);
     delete[] hA;
-    delete[] hB;
+    delete[] hB;    
     delete[] hC;
 
     return 0;

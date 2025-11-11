@@ -2,644 +2,197 @@
 #include <cuda_runtime.h>  
 #include <stdio.h>         
 
-__global__ void matmul_0_1(const half *A, const half *B, half *C, int M, int N, int K) {
+__global__ void matmul_0_1(const half *A, const half *B, half *C,
+                           int M, int N, int K) {
     int col = threadIdx.x + blockDim.x * blockIdx.x;
     int row = threadIdx.y + blockDim.y * blockIdx.y;
 
-    if ( row < M && col < N ) {
+    if (row < M && col < N) {
         float acc = 0.f;
-        for (int i = 0; i< K; i++) {
-        __half a = A[row*K + i];
-        __half b = B[col + i*N];
-        float psum = __half2float(__hmul(a, b)); 
-        acc += psum; } // row major indexing, FP16 × FP16 → FP32
-    C [row * N + col] = __float2half(acc); // FP32 → FP16
-
-    }
-    
-}
-
-
-#include <mma.h>
-#include <stdio.h>
-#include <cuda_fp16.h>
-#define N_STAGES 3
-
-
-__forceinline__
-__device__ void cp_async(uint4 *dstAddr, const uint4 *srcAddr) {
-  unsigned ptxDstAddr = __cvta_generic_to_shared(dstAddr);
-  asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"
-      :: "r"(ptxDstAddr),
-      "l"(srcAddr),
-      "n"(16));
-}
-
-
-__forceinline__ 
-__device__ void load_matrix_x4(unsigned *destReg, uint4 *srcAddr) {
-  unsigned ptxSrcAddr = __cvta_generic_to_shared(srcAddr);
-  asm volatile(
-      "ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-      : "=r"(destReg[0]), "=r"(destReg[1]), "=r"(destReg[2]), "=r"(destReg[3])
-      :  "r"(ptxSrcAddr)
-      );
-}
-
-__forceinline__ 
-__device__ void load_matrix_x2(unsigned *destReg, uint4 *srcAddr) {
-  unsigned ptxSrcAddr = __cvta_generic_to_shared(srcAddr);
-  asm volatile(
-      "ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0, %1}, [%2];\n"
-      : "=r"(destReg[0]), "=r"(destReg[1])
-      :  "r"(ptxSrcAddr)
-      );
-}
-
-__forceinline__ 
-__device__ void mma_m16n8k16(const unsigned *A, const unsigned *B, float *C, float *D) {
-  asm(
-      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
-      : "=f"(D[0]), "=f"(D[1]), "=f"(D[2]), "=f"(D[3])
-      :
-      "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
-      "r"(B[0]), "r"(B[1]),
-      "f"(C[0]), "f"(C[1]), "f"(C[2]), "f"(C[3])
-     );
-}
-
-__forceinline__ 
-__device__ void mma_m16n8k16_f16(const unsigned *A, const unsigned *B, unsigned *C, unsigned *D) {
-  asm (
-      "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
-      "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%8,%9};\n"
-      : "=r"(D[0]), "=r"(D[1])
-      :
-      "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
-      "r"(B[0]), "r"(B[1]),
-      "r"(C[0]), "r"(C[1])
-      );
-}
-
-
-// Kernel 3.0: N-STAGE CP.ASYNC
-__launch_bounds__(16 * 16)
-__global__ void mma_matmul_3_0(const half *A, const half *B, float *C, int M, int N, int K) {
-  __shared__ uint4 As[N_STAGES*32][8];
-  __shared__ uint4 Bs[N_STAGES*32][8];
-
-  uint4 (*aLoadPtr)[8];
-  uint4 (*bLoadPtr)[8];
-  uint4 (*aStorePtr)[8];
-  uint4 (*bStorePtr)[8];
-
-  int blockRowStart = blockIdx.y*64;
-  int blockColStart = blockIdx.x*64;
-  const uint4 *globalTileA = reinterpret_cast<const uint4 *>(A + blockRowStart*K); 
-  const uint4 *globalTileB = reinterpret_cast<const uint4 *>(B + blockColStart*K);
-
-  // warp layout is 2 x 4
-  // (warp_0 | warp_1 | warp_2 | warp_3)
-  // (warp_4 | warp_5 | warp_6 | warp_7)
-  int threadID = threadIdx.y * blockDim.x + threadIdx.x;
-  int warpID = threadID / 32;
-  int laneID = threadID % 32;
-  int warpOffsetA = 16 * (warpID / 4);
-  int warpOffsetB = 8 * (warpID % 4);
-
-  unsigned aReg[2][8];
-  unsigned bReg[2][4];
-  float dReg[2][2][4] = {0.};
-
-  // row / column indices when storing to shared memory
-  int storeRow = warpID * 4 + laneID / 8;
-  int storeCol = (laneID % 8) ^ (laneID / 8);
-
-  // row/column indices when loading from permuted shmem layout to registers
-  int loadRowA = (laneID % 16) / 2;
-  int loadColA = (laneID / 16 + 4 * (laneID % 2)) ^ (loadRowA % 4);
-  int loadRowB = (laneID % 8) / 2;
-  int loadColB = (laneID / 8 + 4 * (laneID % 2)) ^ (loadRowB % 4);
-
-  const uint4 *aGlobalAddress = globalTileA + (warpID*8 + laneID/4)*K/8 + laneID%4;
-  const uint4 *bGlobalAddress = globalTileB + (warpID*8 + laneID/4)*K/8 + laneID%4;
-
-  // PRELUDE: load first (N_STAGES - 1) into shared memory
-  for (int nStage=0; nStage < N_STAGES - 1; nStage++) {
-    int kStart = nStage * 4;
-    aStorePtr = As + 32 * nStage;
-    bStorePtr = Bs + 32 * nStage;
-    cp_async(aStorePtr[storeRow] + storeCol, aGlobalAddress + kStart);
-    cp_async(bStorePtr[storeRow] + storeCol, bGlobalAddress + kStart);
-    asm volatile("cp.async.commit_group;\n" ::);
-  }
-
-  //  MAIN LOOP OVER K BLOCKS
-  for (int nStage=0; nStage < K/32; nStage++) {
-    int kStart = (N_STAGES-1+nStage) * 4;
-    aStorePtr = As + 32 * ((nStage + N_STAGES-1) % N_STAGES);
-    bStorePtr = Bs + 32 * ((nStage + N_STAGES-1) % N_STAGES);
-    aLoadPtr = As + 32 * (nStage % N_STAGES);
-    bLoadPtr = Bs + 32 * (nStage % N_STAGES);
-    
-    asm volatile("cp.async.wait_group %0;\n" :: "n"(N_STAGES-2));
-    __syncthreads();
-
-    // Preload the fragments for k=0..1, k=2..3 for both A/B tiles 
-    for (int m=0; m<2; m++) {
-      load_matrix_x4(aReg[m]    , aLoadPtr[m*8 + warpOffsetA + loadRowA] + loadColA);
-      load_matrix_x4(aReg[m] + 4, aLoadPtr[m*8 + warpOffsetA + loadRowA] + (loadColA^2));
-    }
-    for (int n=0; n<2; n++) {
-      load_matrix_x2(bReg[n]   , bLoadPtr[n*4 + warpOffsetB + loadRowB] + loadColB);
-      load_matrix_x2(bReg[n]+ 2, bLoadPtr[n*4 + warpOffsetB + loadRowB] + (loadColB^2));
-    }
-
-    // Start next cp.async
-    kStart = (kStart > 512-4) ? 512-4 : kStart;
-    cp_async(aStorePtr[storeRow] + storeCol, aGlobalAddress + kStart);
-    cp_async(bStorePtr[storeRow] + storeCol, bGlobalAddress + kStart);
-    asm volatile("cp.async.commit_group;\n" ::);
-
-    // Compute the mmas
-    for (int m=0; m<2; m++) {
-      for (int n=0; n<2; n++) {
-        mma_m16n8k16(aReg[m]    , bReg[n]    , dReg[m][n], dReg[m][n]);
-        mma_m16n8k16(aReg[m] + 4, bReg[n] + 2, dReg[m][n], dReg[m][n]);
-      }
-    }
-  }
-
-  int groupID     = laneID >> 2;
-  int groupLaneID = (laneID % 4);
-  for (int m = 0; m < 2; m++) {
-    for (int n = 0; n <  2; n++) {
-      float2 d0 = make_float2(dReg[m][n][0], dReg[m][n][1]);
-      float2 d2 = make_float2(dReg[m][n][2], dReg[m][n][3]);
-      float2 *cOut0 = reinterpret_cast<float2 *>(&C[(blockRowStart + m*16 + 2 * warpOffsetA + groupID    )*N + blockColStart + n*8 + 2 * warpOffsetB + 2*groupLaneID]);
-      float2 *cOut2 = reinterpret_cast<float2 *>(&C[(blockRowStart + m*16 + 2 * warpOffsetA + groupID + 8)*N + blockColStart + n*8 + 2 * warpOffsetB + 2*groupLaneID]);
-      *cOut0 = d0;
-      *cOut2 = d2;
-    }
-  }
-}
-
-// Kernel 3.1: n stage pipeline plus 4x tiling
-__launch_bounds__(16 * 16)
-__global__ void mma_matmul_3_1(const half *A, const half *B, float *C, int M, int N, int K) {
-  __shared__ uint4 As[N_STAGES*64][8];
-  __shared__ uint4 Bs[N_STAGES*64][8];
-
-  uint4 (*aLoadPtr)[8];
-  uint4 (*bLoadPtr)[8];
-  uint4 (*aStorePtr)[8];
-  uint4 (*bStorePtr)[8];
-
-  int blockRowStart = blockIdx.y*128;
-  int blockColStart = blockIdx.x*128;
-  const uint4 *globalTileA = reinterpret_cast<const uint4 *>(A + blockRowStart*K); 
-  const uint4 *globalTileB = reinterpret_cast<const uint4 *>(B + blockColStart*K);
-
-  // warp layout is 2 x 4
-  // (warp_0 | warp_1 | warp_2 | warp_3)
-  // (warp_4 | warp_5 | warp_6 | warp_7)
-  int threadID = threadIdx.y * blockDim.x + threadIdx.x;
-  int warpID = threadID / 32;
-  int laneID = threadID % 32;
-  int warpOffsetA = 32 * (warpID / 4);
-  int warpOffsetB = 16 * (warpID % 4);
-
-  unsigned aReg[4][8];
-  unsigned bReg[4][4];
-  float dReg[4][4][4] = {0.};
-
-  // row / column indices when storing to shared memory
-  int storeRow = warpID * 4 + laneID / 8;
-  int storeCol = (laneID % 8) ^ (laneID / 8);
-
-  // row / column indices when loading from permuted shmem layout to registers
-  int loadRowA = (laneID % 16) / 2;
-  int loadColA = (laneID / 16 + 4 * (laneID % 2)) ^ (loadRowA % 4);
-  int loadRowB = (laneID % 8) / 2;
-  int loadColB = (laneID / 8 + 4 * (laneID % 2)) ^ (loadRowB % 4);
-
-  const uint4 *aGlobalAddress = globalTileA + (warpID*8 + laneID/4)*K/8 + laneID%4;
-  const uint4 *bGlobalAddress = globalTileB + (warpID*8 + laneID/4)*K/8 + laneID%4;
-
-  // PRELUDE: load first (N_STAGES - 1) into shared memory
-  for (int nStage=0; nStage < N_STAGES - 1; nStage++) {
-    int kStart = nStage * 4;
-    aStorePtr = As + 64 * nStage;
-    bStorePtr = Bs + 64 * nStage;
-    cp_async(aStorePtr[storeRow     ] + storeCol, aGlobalAddress + kStart);
-    cp_async(aStorePtr[storeRow + 32] + storeCol, aGlobalAddress + 64 * K/8 + kStart);
-    cp_async(bStorePtr[storeRow     ] + storeCol, bGlobalAddress + kStart);
-    cp_async(bStorePtr[storeRow + 32] + storeCol, bGlobalAddress + 64 * K/8 + kStart);
-    asm volatile("cp.async.commit_group;\n" ::);
-  }
-
-  //  MAIN LOOP OVER K BLOCKS
-  for (int nStage=0; nStage < K/32; nStage++) {
-    int kStart = (N_STAGES-1+nStage) * 4;
-    aStorePtr = As + 64 * ((nStage + N_STAGES-1) % N_STAGES);
-    bStorePtr = Bs + 64 * ((nStage + N_STAGES-1) % N_STAGES);
-    aLoadPtr = As + 64 * (nStage % N_STAGES);
-    bLoadPtr = Bs + 64 * (nStage % N_STAGES);
-
-    asm volatile("cp.async.wait_group %0;\n" :: "n"(N_STAGES-2));
-    __syncthreads();
-
-    // Preload the fragments for k=0..1, k=2..3 for both A/B tiles 
-    for (int m=0; m<4; m++) {
-      load_matrix_x4(aReg[m]    , aLoadPtr[m*8 + warpOffsetA + loadRowA] + loadColA);
-      load_matrix_x4(aReg[m] + 4, aLoadPtr[m*8 + warpOffsetA + loadRowA] + (loadColA^2));
-    }
-    for (int n=0; n<4; n++) {
-      load_matrix_x2(bReg[n]    , bLoadPtr[n*4 + warpOffsetB + loadRowB] + loadColB);
-      load_matrix_x2(bReg[n] + 2, bLoadPtr[n*4 + warpOffsetB + loadRowB] + (loadColB^2));
-    }
-
-    // Start next cp.async
-    kStart = (kStart > 512-4) ? 512-4 : kStart;
-    cp_async(aStorePtr[storeRow     ] + storeCol, aGlobalAddress + kStart);
-    cp_async(aStorePtr[storeRow + 32] + storeCol, aGlobalAddress + 64 * K/8 + kStart);
-    cp_async(bStorePtr[storeRow     ] + storeCol, bGlobalAddress + kStart);
-    cp_async(bStorePtr[storeRow + 32] + storeCol, bGlobalAddress + 64 * K/8 + kStart);
-    asm volatile("cp.async.commit_group;\n" ::);
-
-    // Compute the mmas
-    for (int m=0; m<4; m++) {
-      for (int n=0; n<4; n++) {
-        mma_m16n8k16(aReg[m]    , bReg[n]    , dReg[m][n], dReg[m][n]);
-        mma_m16n8k16(aReg[m] + 4, bReg[n] + 2, dReg[m][n], dReg[m][n]);
-      }
-    }
-  }
-  int groupID     = laneID >> 2;
-  int groupLaneID = (laneID % 4);
-  for (int m = 0; m < 4; m++) {
-    for (int n = 0; n <  4; n++) {
-      float2 d0 = make_float2(dReg[m][n][0], dReg[m][n][1]);
-      float2 d2 = make_float2(dReg[m][n][2], dReg[m][n][3]);
-      float2 *cOut0 = reinterpret_cast<float2 *>(&C[(blockRowStart + m*16 + 2 * warpOffsetA + groupID    )*N + blockColStart + n*8 + 2 * warpOffsetB + 2*groupLaneID]);
-      float2 *cOut2 = reinterpret_cast<float2 *>(&C[(blockRowStart + m*16 + 2 * warpOffsetA + groupID + 8)*N + blockColStart + n*8 + 2 * warpOffsetB + 2*groupLaneID]);
-      *cOut0 = d0;
-      *cOut2 = d2;
-    }
-  }
-}
-
-// Kernel 3.2: n stage pipeline plus 4x tiling, two-stage fp16/16 with fp32 accum
-__launch_bounds__(16 * 16, 2)
-//__maxnreg__(128)
-__global__ void mma_matmul_3_2(const half *A, const half *B, float *C, int M, int N, int K) {
-  __shared__ uint4 As[N_STAGES*64][8];
-  __shared__ uint4 Bs[N_STAGES*64][8];
-
-  uint4 (*aLoadPtr)[8];
-  uint4 (*bLoadPtr)[8];
-  uint4 (*aStorePtr)[8];
-  uint4 (*bStorePtr)[8];
-
-  int blockRowStart = blockIdx.y*128;
-  int blockColStart = blockIdx.x*128;
-  const uint4 *globalTileA = reinterpret_cast<const uint4 *>(A + blockRowStart*K); 
-  const uint4 *globalTileB = reinterpret_cast<const uint4 *>(B + blockColStart*K);
-
-  // warp layout is 2 x 4
-  // (warp_0 | warp_1 | warp_2 | warp_3)
-  // (warp_4 | warp_5 | warp_6 | warp_7)
-  int threadID = threadIdx.y * blockDim.x + threadIdx.x;
-  int warpID = threadID / 32;
-  int laneID = threadID % 32;
-  int warpOffsetA = 32 * (warpID / 4);
-  int warpOffsetB = 16 * (warpID % 4);
-
-  unsigned aReg[4][8];
-  unsigned bReg[4][4];
-  unsigned cReg[2] = {0};
-  unsigned dReg[4][4] = {0};
-  half  *dRegPtr; 
-  float dRegAcc[4][4][4] = {0};
-
-  // row / column indices when storing to shared memory
-  int storeRow = warpID * 4 + laneID / 8;
-  int storeCol = (laneID % 8) ^ (laneID / 8);
-
-  // row / column indices when loading from permuted shmem layout to registers
-  int loadRowA = (laneID % 16) / 2;
-  int loadColA = (laneID / 16 + 4 * (laneID % 2)) ^ (loadRowA % 4);
-  int loadRowB = (laneID % 8) / 2;
-  int loadColB = (laneID / 8 + 4 * (laneID % 2)) ^ (loadRowB % 4);
-
-  const uint4 *aGlobalAddress = globalTileA + (warpID*8 + laneID/4)*K/8 + laneID%4;
-  const uint4 *bGlobalAddress = globalTileB + (warpID*8 + laneID/4)*K/8 + laneID%4;
-
-  // PRELUDE: load first (N_STAGES - 1) into shared memory
-  for (int nStage=0; nStage < N_STAGES - 1; nStage++) {
-    int kStart = nStage * 4;
-    aStorePtr = As + 64 * nStage;
-    bStorePtr = Bs + 64 * nStage;
-    cp_async(aStorePtr[storeRow     ] + storeCol, aGlobalAddress + kStart);
-    cp_async(aStorePtr[storeRow + 32] + storeCol, aGlobalAddress + 64 * K/8 + kStart);
-    cp_async(bStorePtr[storeRow     ] + storeCol, bGlobalAddress + kStart);
-    cp_async(bStorePtr[storeRow + 32] + storeCol, bGlobalAddress + 64 * K/8 + kStart);
-    asm volatile("cp.async.commit_group;\n" ::);
-  }
-
-  //  MAIN LOOP OVER K BLOCKS
-  // const int accStep = 1;
-  for (int nStage=0; nStage < K/32; nStage++) {
-    int kStart = (N_STAGES-1+nStage) * 4;
-    aStorePtr = As + 64 * ((nStage + N_STAGES-1) % N_STAGES);
-    bStorePtr = Bs + 64 * ((nStage + N_STAGES-1) % N_STAGES);
-    aLoadPtr = As + 64 * (nStage % N_STAGES);
-    bLoadPtr = Bs + 64 * (nStage % N_STAGES);
-
-    asm volatile("cp.async.wait_group %0;\n" :: "n"(N_STAGES-2));
-    __syncthreads();
-
-    // Preload the fragments for k=0..1, k=2..3 for both A/B tiles 
-    for (int m=0; m<4; m++) {
-      load_matrix_x4(aReg[m]    , aLoadPtr[m*8 + warpOffsetA + loadRowA] + loadColA);
-      load_matrix_x4(aReg[m] + 4, aLoadPtr[m*8 + warpOffsetA + loadRowA] + (loadColA^2));
-    }
-    for (int n=0; n<4; n++) {
-      load_matrix_x2(bReg[n]    , bLoadPtr[n*4 + warpOffsetB + loadRowB] + loadColB);
-      load_matrix_x2(bReg[n] + 2, bLoadPtr[n*4 + warpOffsetB + loadRowB] + (loadColB^2));
-    }
-
-    // Start next cp.async
-    kStart = (kStart > 512-4) ? 512-4 : kStart;
-    cp_async(aStorePtr[storeRow     ] + storeCol, aGlobalAddress + kStart);
-    cp_async(aStorePtr[storeRow + 32] + storeCol, aGlobalAddress + 64 * K/8 + kStart);
-    cp_async(bStorePtr[storeRow     ] + storeCol, bGlobalAddress + kStart);
-    cp_async(bStorePtr[storeRow + 32] + storeCol, bGlobalAddress + 64 * K/8 + kStart);
-    asm volatile("cp.async.commit_group;\n" ::);
-
-    // Compute the mmas
-    for (int m=0; m<4; m++) {
-      for (int n=0; n<4; n++) {
-        dRegPtr = reinterpret_cast<half *>(dReg[n]);
-        mma_m16n8k16_f16(aReg[m]    , bReg[n]    , cReg, dReg[n]);
-        mma_m16n8k16_f16(aReg[m] + 4, bReg[n] + 2, cReg, dReg[n]+2);
-        dRegAcc[m][n][0] += __half2float(dRegPtr[0]);
-        dRegAcc[m][n][1] += __half2float(dRegPtr[1]);
-        dRegAcc[m][n][2] += __half2float(dRegPtr[2]);
-        dRegAcc[m][n][3] += __half2float(dRegPtr[3]);
-
-        dRegAcc[m][n][0] += __half2float(dRegPtr[4]);
-        dRegAcc[m][n][1] += __half2float(dRegPtr[5]);
-        dRegAcc[m][n][2] += __half2float(dRegPtr[6]);
-        dRegAcc[m][n][3] += __half2float(dRegPtr[7]);
-      }
-    }
-  }
-  int groupID     = laneID >> 2;
-  int groupLaneID = (laneID % 4);
-  for (int m = 0; m < 4; m++) {
-    for (int n = 0; n <  4; n++) {
-      float2* d0 = reinterpret_cast<float2 *>(&dRegAcc[m][n]);
-      float2* d2 = reinterpret_cast<float2 *>(&dRegAcc[m][n]) + 1;
-      float2 *cOut0 = reinterpret_cast<float2 *>(&C[(blockRowStart + m*16 + 2 * warpOffsetA + groupID    )*N + blockColStart + n*8 + 2 * warpOffsetB + 2*groupLaneID]);
-      float2 *cOut2 = reinterpret_cast<float2 *>(&C[(blockRowStart + m*16 + 2 * warpOffsetA + groupID + 8)*N + blockColStart + n*8 + 2 * warpOffsetB + 2*groupLaneID]);
-      *cOut0 = *d0;
-      *cOut2 = *d2;
-    }
-  }
-}
-
-
-// Kernel 3.3: n stage pipeline plus 4x tiling, fp16/16 and convert output to fp32
-__launch_bounds__(16 * 16)
-__global__ void mma_matmul_3_3(const half *A, const half *B, float *C, int M, int N, int K) {
-  __shared__ uint4 As[N_STAGES*64][8];
-  __shared__ uint4 Bs[N_STAGES*64][8];
-
-  uint4 (*aLoadPtr)[8];
-  uint4 (*bLoadPtr)[8];
-  uint4 (*aStorePtr)[8];
-  uint4 (*bStorePtr)[8];
-
-  int blockRowStart = blockIdx.y*128;
-  int blockColStart = blockIdx.x*128;
-  const uint4 *globalTileA = reinterpret_cast<const uint4 *>(A + blockRowStart*K); 
-  const uint4 *globalTileB = reinterpret_cast<const uint4 *>(B + blockColStart*K);
-
-  // warp layout is 2 x 4
-  // (warp_0 | warp_1 | warp_2 | warp_3)
-  // (warp_4 | warp_5 | warp_6 | warp_7)
-  int threadID = threadIdx.y * blockDim.x + threadIdx.x;
-  int warpID = threadID / 32;
-  int laneID = threadID % 32;
-  int warpOffsetA = 32 * (warpID / 4);
-  int warpOffsetB = 16 * (warpID % 4);
-
-  unsigned aReg[4][8];
-  unsigned bReg[4][4];
-  unsigned dReg[4][4][2] = {0};
-  half *dRegHalf;
-
-  // row / column indices when storing to shared memory
-  int storeRow = warpID * 4 + laneID / 8;
-  int storeCol = (laneID % 8) ^ (laneID / 8);
-
-  // row / column indices when loading from permuted shmem layout to registers
-  int loadRowA = (laneID % 16) / 2;
-  int loadColA = (laneID / 16 + 4 * (laneID % 2)) ^ (loadRowA % 4);
-  int loadRowB = (laneID % 8) / 2;
-  int loadColB = (laneID / 8 + 4 * (laneID % 2)) ^ (loadRowB % 4);
-
-  const uint4 *aGlobalAddress = globalTileA + (warpID*8 + laneID/4)*K/8 + laneID%4;
-  const uint4 *bGlobalAddress = globalTileB + (warpID*8 + laneID/4)*K/8 + laneID%4;
-
-  // PRELUDE: load first (N_STAGES - 1) into shared memory
-  for (int nStage=0; nStage < N_STAGES - 1; nStage++) {
-    int kStart = nStage * 4;
-    aStorePtr = As + 64 * nStage;
-    bStorePtr = Bs + 64 * nStage;
-    cp_async(aStorePtr[storeRow     ] + storeCol, aGlobalAddress + kStart);
-    cp_async(aStorePtr[storeRow + 32] + storeCol, aGlobalAddress + 64 * K/8 + kStart);
-    cp_async(bStorePtr[storeRow     ] + storeCol, bGlobalAddress + kStart);
-    cp_async(bStorePtr[storeRow + 32] + storeCol, bGlobalAddress + 64 * K/8 + kStart);
-    asm volatile("cp.async.commit_group;\n" ::);
-  }
-
-  //  MAIN LOOP OVER K BLOCKS
-  for (int nStage=0; nStage < K/32; nStage++) {
-    int kStart = (N_STAGES-1+nStage) * 4;
-    aStorePtr = As + 64 * ((nStage + N_STAGES-1) % N_STAGES);
-    bStorePtr = Bs + 64 * ((nStage + N_STAGES-1) % N_STAGES);
-    aLoadPtr = As + 64 * (nStage % N_STAGES);
-    bLoadPtr = Bs + 64 * (nStage % N_STAGES);
-
-    asm volatile("cp.async.wait_group %0;\n" :: "n"(N_STAGES-2));
-    __syncthreads();
-
-    // Preload the fragments for k=0..1, k=2..3 for both A/B tiles 
-    for (int m=0; m<4; m++) {
-      load_matrix_x4(aReg[m]    , aLoadPtr[m*8 + warpOffsetA + loadRowA] + loadColA);
-      load_matrix_x4(aReg[m] + 4, aLoadPtr[m*8 + warpOffsetA + loadRowA] + (loadColA^2));
-    }
-    for (int n=0; n<4; n++) {
-      load_matrix_x2(bReg[n]    , bLoadPtr[n*4 + warpOffsetB + loadRowB] + loadColB);
-      load_matrix_x2(bReg[n] + 2, bLoadPtr[n*4 + warpOffsetB + loadRowB] + (loadColB^2));
-    }
-
-    // Start next cp.async
-    kStart = (kStart > 512-4) ? 512-4 : kStart;
-    cp_async(aStorePtr[storeRow     ] + storeCol, aGlobalAddress + kStart);
-    cp_async(aStorePtr[storeRow + 32] + storeCol, aGlobalAddress + 64 * K/8 + kStart);
-    cp_async(bStorePtr[storeRow     ] + storeCol, bGlobalAddress + kStart);
-    cp_async(bStorePtr[storeRow + 32] + storeCol, bGlobalAddress + 64 * K/8 + kStart);
-    asm volatile("cp.async.commit_group;\n" ::);
-
-    // Compute the mmas
-    for (int m=0; m<4; m++) {
-      for (int n=0; n<4; n++) {
-        mma_m16n8k16_f16(aReg[m]    , bReg[n]    , dReg[m][n], dReg[m][n]);
-        mma_m16n8k16_f16(aReg[m] + 4, bReg[n] + 2, dReg[m][n], dReg[m][n]);
-      }
-    }
-  }
-  int groupID     = laneID >> 2;
-  int groupLaneID = (laneID % 4);
-  for (int m = 0; m < 4; m++) {
-    for (int n = 0; n <  4; n++) {
-      dRegHalf = reinterpret_cast<half *>(dReg[m][n]);
-      float2 d0 = make_float2(__half2float(dRegHalf[0]), __half2float(dRegHalf[1]));
-      float2 d2 = make_float2(__half2float(dRegHalf[2]), __half2float(dRegHalf[3]));
-      float2 *cOut0 = reinterpret_cast<float2 *>(&C[(blockRowStart + m*16 + 2 * warpOffsetA + groupID    )*N + blockColStart + n*8 + 2 * warpOffsetB + 2*groupLaneID]);
-      float2 *cOut2 = reinterpret_cast<float2 *>(&C[(blockRowStart + m*16 + 2 * warpOffsetA + groupID + 8)*N + blockColStart + n*8 + 2 * warpOffsetB + 2*groupLaneID]);
-      *cOut0 = d0;
-      *cOut2 = d2;
-    }
-  }
-}
-
-// Kernel 3.4: n stage pipeline plus 4x tiling, customizable two-stage fp16/16 with fp32 accum every accStep steps
-__launch_bounds__(16 * 16, 2)
-//__maxnreg__(128)
-__global__ void mma_matmul_3_4(const half *A, const half *B, float *C, int M, int N, int K) {
-  __shared__ uint4 As[N_STAGES*64][8];
-  __shared__ uint4 Bs[N_STAGES*64][8];
-
-  uint4 (*aLoadPtr)[8];
-  uint4 (*bLoadPtr)[8];
-  uint4 (*aStorePtr)[8];
-  uint4 (*bStorePtr)[8];
-
-  int blockRowStart = blockIdx.y*128;
-  int blockColStart = blockIdx.x*128;
-  const uint4 *globalTileA = reinterpret_cast<const uint4 *>(A + blockRowStart*K); 
-  const uint4 *globalTileB = reinterpret_cast<const uint4 *>(B + blockColStart*K);
-
-  // warp layout is 2 x 4
-  // (warp_0 | warp_1 | warp_2 | warp_3)
-  // (warp_4 | warp_5 | warp_6 | warp_7)
-  int threadID = threadIdx.y * blockDim.x + threadIdx.x;
-  int warpID = threadID / 32;
-  int laneID = threadID % 32;
-  int warpOffsetA = 32 * (warpID / 4);
-  int warpOffsetB = 16 * (warpID % 4);
-
-  unsigned aReg[4][8];
-  unsigned bReg[4][4];
-  unsigned dReg[4][4][2] = {0};
-  half2 *dRegPtr; 
-  float dRegAcc[4][4][4] = {0};
-  float2 tmp[2];
-
-  // row / column indices when storing to shared memory
-  int storeRow = warpID * 4 + laneID / 8;
-  int storeCol = (laneID % 8) ^ (laneID / 8);
-
-  // row / column indices when loading from permuted shmem layout to registers
-  int loadRowA = (laneID % 16) / 2;
-  int loadColA = (laneID / 16 + 4 * (laneID % 2)) ^ (loadRowA % 4);
-  int loadRowB = (laneID % 8) / 2;
-  int loadColB = (laneID / 8 + 4 * (laneID % 2)) ^ (loadRowB % 4);
-
-  const uint4 *aGlobalAddress = globalTileA + (warpID*8 + laneID/4)*K/8 + laneID%4;
-  const uint4 *bGlobalAddress = globalTileB + (warpID*8 + laneID/4)*K/8 + laneID%4;
-
-  // PRELUDE: load first (N_STAGES - 1) into shared memory
-  for (int nStage=0; nStage < N_STAGES - 1; nStage++) {
-    int kStart = nStage * 4;
-    aStorePtr = As + 64 * nStage;
-    bStorePtr = Bs + 64 * nStage;
-    cp_async(aStorePtr[storeRow     ] + storeCol, aGlobalAddress + kStart);
-    cp_async(aStorePtr[storeRow + 32] + storeCol, aGlobalAddress + 64 * K/8 + kStart);
-    cp_async(bStorePtr[storeRow     ] + storeCol, bGlobalAddress + kStart);
-    cp_async(bStorePtr[storeRow + 32] + storeCol, bGlobalAddress + 64 * K/8 + kStart);
-    asm volatile("cp.async.commit_group;\n" ::);
-  }
-
-  //  MAIN LOOP OVER K BLOCKS
-  const int accStep = 1;
-  for (int nStage=0; nStage < K/32; nStage++) {
-    int kStart = (N_STAGES-1+nStage) * 4;
-    aStorePtr = As + 64 * ((nStage + N_STAGES-1) % N_STAGES);
-    bStorePtr = Bs + 64 * ((nStage + N_STAGES-1) % N_STAGES);
-    aLoadPtr = As + 64 * (nStage % N_STAGES);
-    bLoadPtr = Bs + 64 * (nStage % N_STAGES);
-
-    asm volatile("cp.async.wait_group %0;\n" :: "n"(N_STAGES-2));
-    __syncthreads();
-
-    // Preload the fragments for k=0..1, k=2..3 for both A/B tiles 
-    for (int m=0; m<4; m++) {
-      load_matrix_x4(aReg[m]    , aLoadPtr[m*8 + warpOffsetA + loadRowA] + loadColA);
-      load_matrix_x4(aReg[m] + 4, aLoadPtr[m*8 + warpOffsetA + loadRowA] + (loadColA^2));
-    }
-    for (int n=0; n<4; n++) {
-      load_matrix_x2(bReg[n]    , bLoadPtr[n*4 + warpOffsetB + loadRowB] + loadColB);
-      load_matrix_x2(bReg[n] + 2, bLoadPtr[n*4 + warpOffsetB + loadRowB] + (loadColB^2));
-    }
-
-    // Start next cp.async
-    kStart = (kStart > 512-4) ? 512-4 : kStart;
-    cp_async(aStorePtr[storeRow     ] + storeCol, aGlobalAddress + kStart);
-    cp_async(aStorePtr[storeRow + 32] + storeCol, aGlobalAddress + 64 * K/8 + kStart);
-    cp_async(bStorePtr[storeRow     ] + storeCol, bGlobalAddress + kStart);
-    cp_async(bStorePtr[storeRow + 32] + storeCol, bGlobalAddress + 64 * K/8 + kStart);
-    asm volatile("cp.async.commit_group;\n" ::);
-
-    // Compute the mmas
-    for (int m=0; m<4; m++) {
-      for (int n=0; n<4; n++) {
-        mma_m16n8k16_f16(aReg[m]    , bReg[n]    , dReg[m][n], dReg[m][n]);
-        mma_m16n8k16_f16(aReg[m] + 4, bReg[n] + 2, dReg[m][n], dReg[m][n]);
-      }
-    }
-
-    if (nStage % accStep == accStep-1) {
-      for (int m=0; m<4; m++) {
-        for (int n=0; n<4; n++) {
-          dRegPtr = reinterpret_cast<half2 *>(dReg[m][n]);
-          tmp[0] = __half22float2(dRegPtr[0]);
-          tmp[1] = __half22float2(dRegPtr[1]);
-          dRegAcc[m][n][0] += tmp[0].x;
-          dRegAcc[m][n][1] += tmp[0].y;
-          dRegAcc[m][n][2] += tmp[1].x;
-          dRegAcc[m][n][3] += tmp[1].y;
-          dReg[m][n][0] = 0.;
-          dReg[m][n][1] = 0.;
+        for (int i = 0; i < K; i++) {
+            __half a = A[row * K + i];   // row-major
+            __half b = B[col * K + i];   // col-major (col index 먼저)
+            float psum = __half2float(__hmul(a, b));
+            acc += psum;
         }
+        C[row * N + col] = __float2half(acc);
+    }
+}
+
+// Kernel 1.0: Naive mma 
+#include <mma.h>
+#include <cuda_fp16.h>
+#define M_TILE 2
+#define N_TILE 2
+__forceinline__ __device__
+void mma_m16n8k16(const unsigned *A, const unsigned *B, float *C, float *D) {
+  asm volatile(
+    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+    : "=f"(D[0]),"=f"(D[1]),"=f"(D[2]),"=f"(D[3])
+    : "r"(A[0]),"r"(A[1]),"r"(A[2]),"r"(A[3]),
+      "r"(B[0]),"r"(B[1]),
+      "f"(C[0]),"f"(C[1]),"f"(C[2]),"f"(C[3])
+  );
+}
+
+// blockDim.x == 32 (1 warp), grid = (N/8, M/16)
+__global__ void mma_matmul_1_0(const half* __restrict__ A,
+                               const half* __restrict__ B, // column-major
+                               half* __restrict__ C,
+                               int M, int N, int K) {
+  const int lane = threadIdx.x;            // 0..31
+  const int m0 = blockIdx.y * 16;          // 출력 블록 시작 행
+  const int n0 = blockIdx.x * 8;           // 출력 블록 시작 열
+
+  // 누산 레지스터
+  float dReg[4] = {0.f, 0.f, 0.f, 0.f};
+
+  // lane→(groupID, groupLane) 매핑
+  const int groupID     = lane / 4;  // 0..7
+  const int groupLaneID = lane % 4;  // 0..3
+
+  // K를 16씩 루프
+  for (int k0 = 0; k0 < K; k0 += 16) {
+    // 각 mma 호출용 레지스터 조립 (A: 8 halves, B: 4 halves)
+    half aReg[8];
+    half bReg[4];
+
+    // A: row-major, tile: [m0..m0+15]×[k0..k0+15]
+    // (아래 인덱스 매핑은 NVIDIA warp 프래그먼트 매핑을 따름)
+    int ar = m0 + (groupID);          // 0..15
+    int ar8= m0 + (groupID + 8);      // 8..23(경계는 아래서 가드)
+    int ac0= k0 + groupLaneID*2;      // 0,2,4,6
+    int ac8= k0 + groupLaneID*2 + 8;  // 8,10,12,14
+
+    auto ldA = [&](int r, int c)->half {
+      if (r < M && c < K) return A[r * K + c];
+      return __float2half(0.f);
+    };
+    aReg[0] = ldA(ar , ac0+0);
+    aReg[1] = ldA(ar , ac0+1);
+    aReg[2] = ldA(ar8, ac0+0);
+    aReg[3] = ldA(ar8, ac0+1);
+    aReg[4] = ldA(ar , ac8+0);
+    aReg[5] = ldA(ar , ac8+1);
+    aReg[6] = ldA(ar8, ac8+0);
+    aReg[7] = ldA(ar8, ac8+1);
+
+    // B: column-major, tile: [k0..k0+15]×[n0..n0+7]
+    int br0 = k0 + groupLaneID*2; // 0,2,4,6
+    int br8 = k0 + groupLaneID*2 + 8;
+    int bc  = n0 + groupID;       // 0..7
+
+    auto ldBcm = [&](int r, int c)->half {
+      if (r < K && c < N) return B[c * K + r]; // column-major
+      return __float2half(0.f);
+    };
+    bReg[0] = ldBcm(br0+0, bc);
+    bReg[1] = ldBcm(br0+1, bc);
+    bReg[2] = ldBcm(br8+0, bc);
+    bReg[3] = ldBcm(br8+1, bc);
+
+    // 레지스터 포인터로 MMA 진행
+    const unsigned* aPtr = reinterpret_cast<const unsigned*>(&aReg[0]);
+    const unsigned* bPtr = reinterpret_cast<const unsigned*>(&bReg[0]);
+    mma_m16n8k16(aPtr, bPtr, dReg, dReg);
+  }
+
+  // 결과 저장 (half로 캐스팅, 경계 가드)
+  auto stC = [&](int r, int c, float v) {
+    if (r < M && c < N) C[r * N + c] = __float2half(v);
+  };
+  int r0 = m0 + groupID;
+  int r8 = m0 + groupID + 8;
+  int c0 = n0 + groupLaneID*2;
+
+  stC(r0, c0+0, dReg[0]);
+  stC(r0, c0+1, dReg[1]);
+  stC(r8, c0+0, dReg[2]);
+  stC(r8, c0+1, dReg[3]);
+}
+
+
+// Kernel 1.1: Naive mma with 2x M/N tiling
+__launch_bounds__(16 * 16)
+__global__ void mma_matmul_1_1(const half *A, const half *B, half *C, int M, int N, int K) {
+  // declare cache in shared memory
+  __shared__ half As[M_TILE * 32][16];
+  __shared__ half Bs[16][N_TILE * 32];
+
+  int mBlock = M_TILE * 32 * blockIdx.y;
+  int nBlock = N_TILE * 32 * blockIdx.x;
+  int tx = threadIdx.x;
+  int ty = threadIdx.y;
+
+  int threadID = threadIdx.y * blockDim.x + threadIdx.x;
+  int warpID = threadID / 32;
+  int laneID = threadID % 32;
+
+  // tile warps as follows
+  // (warp_0 | warp_1 | warp_2 | warp_3)
+  // (warp_4 | warp_5 | warp_6 | warp_7)
+  int nWarp = 8 * (warpID % 4);
+  int mWarp = 16 * (warpID / 4);
+
+  int groupID     = laneID / 4;
+  int groupLaneID = laneID % 4;
+
+  half  aReg[8];
+  half  bReg[4];
+  float dReg[M_TILE][N_TILE][4] = {0.};
+
+  for (int kStart=0; kStart < K; kStart += 16) {
+    for (int m=0; m < M_TILE; ++m) {
+      int mTile = m * 32;
+      As[mTile      + ty][tx] = A[(mBlock + mTile      + ty)*K + kStart + tx];
+      As[mTile + 16 + ty][tx] = A[(mBlock + mTile + 16 + ty)*K + kStart + tx];
+    }
+    for (int n=0; n < N_TILE; ++n) {
+      int nTile = n * 32;
+      // (수정, col-major: offset = (nBlock + nTile + tx)*K + (kStart + ty))
+Bs[ty][nTile      + tx] = B[(nBlock + nTile      + tx) * K + (kStart + ty)];
+Bs[ty][nTile + 16 + tx] = B[(nBlock + nTile + 16 + tx) * K + (kStart + ty)];
+    }
+    __syncthreads();
+    for (int m=0; m < M_TILE; m++) {
+      int mTile = m * 32;
+      // set up the registers for mma call
+      aReg[0] = As[mTile + mWarp + groupID    ][groupLaneID*2    ];
+      aReg[1] = As[mTile + mWarp + groupID    ][groupLaneID*2 + 1];
+      aReg[2] = As[mTile + mWarp + groupID + 8][groupLaneID*2    ];
+      aReg[3] = As[mTile + mWarp + groupID + 8][groupLaneID*2 + 1];
+      aReg[4] = As[mTile + mWarp + groupID    ][groupLaneID*2 + 8];
+      aReg[5] = As[mTile + mWarp + groupID    ][groupLaneID*2 + 9];
+      aReg[6] = As[mTile + mWarp + groupID + 8][groupLaneID*2 + 8];
+      aReg[7] = As[mTile + mWarp + groupID + 8][groupLaneID*2 + 9];
+      for (int n=0; n < N_TILE; n++) {
+        int nTile = n * 32;
+        bReg[0] = Bs[groupLaneID*2 + 0][nTile + nWarp + groupID];
+        bReg[1] = Bs[groupLaneID*2 + 1][nTile + nWarp + groupID];
+        bReg[2] = Bs[groupLaneID*2 + 8][nTile + nWarp + groupID];
+        bReg[3] = Bs[groupLaneID*2 + 9][nTile + nWarp + groupID];
+
+        const unsigned *aPtr = reinterpret_cast<const unsigned*>(aReg);   // 또는 &aReg[0]
+const unsigned *bPtr = reinterpret_cast<const unsigned*>(bReg);   // 또는 &bReg[0]
+
+        mma_m16n8k16(aPtr, bPtr, dReg[m][n], dReg[m][n]);
       }
     }
+    __syncthreads();
   }
-  int groupID     = laneID >> 2;
-  int groupLaneID = (laneID % 4);
-  for (int m = 0; m < 4; m++) {
-    for (int n = 0; n <  4; n++) {
-      float2 d0 = make_float2(dRegAcc[m][n][0], dRegAcc[m][n][1]);
-      float2 d2 = make_float2(dRegAcc[m][n][2], dRegAcc[m][n][3]);
-      float2 *cOut0 = reinterpret_cast<float2 *>(&C[(blockRowStart + m*16 + 2 * warpOffsetA + groupID    )*N + blockColStart + n*8 + 2 * warpOffsetB + 2*groupLaneID]);
-      float2 *cOut2 = reinterpret_cast<float2 *>(&C[(blockRowStart + m*16 + 2 * warpOffsetA + groupID + 8)*N + blockColStart + n*8 + 2 * warpOffsetB + 2*groupLaneID]);
-      *cOut0 = d0;
-      *cOut2 = d2;
+  // Copy dReg to global memory
+  for (int m=0; m < M_TILE; m++) {
+    int mTile = m * 32;
+    for (int n=0; n < N_TILE; n++) {
+      int nTile = n * 32;
+      C[(mBlock + mTile + mWarp + groupID  )*N + nBlock + nTile + nWarp + 2*groupLaneID  ] = __float2half(dReg[m][n][0]);
+      C[(mBlock + mTile + mWarp + groupID  )*N + nBlock + nTile + nWarp + 2*groupLaneID+1] = __float2half(dReg[m][n][1]);
+      C[(mBlock + mTile + mWarp + groupID+8)*N + nBlock + nTile + nWarp + 2*groupLaneID  ] = __float2half(dReg[m][n][2]);
+      C[(mBlock + mTile + mWarp + groupID+8)*N + nBlock + nTile + nWarp + 2*groupLaneID+1] = __float2half(dReg[m][n][3]);
     }
   }
 }
+
+
+

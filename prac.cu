@@ -1,5 +1,12 @@
 #include <cuda_fp16.h>
 #include <cstdio>
+#define TILE_M 16
+#define TILE_N 8
+#define TILE_K 16
+
+// --- ceil_div 매크로 (CUDA용) ---
+#define ceil_div(x, y) (((x) + (y) - 1) / (y))
+
 
 // --- 1. MMA intrinsic 정의 -----------------------------------------------
 __device__ void mma_m16n8k16_f16( // C16×8​ = A16×16 ​× B16×8​ + C16×8​
@@ -32,15 +39,15 @@ __device__ void mma_m16n8k16_f16( // C16×8​ = A16×16 ​× B16×8​ + C16×
 }
 
 // --- 2. 간단한 커널 -------------------------------------------------------
-__global__ void test_mma_kernel(half *out) {
+__global__ void test_mma_kernel(half *A, half *B, half *out, int M, int N, int K)  {
+if (blockIdx.x < ceil_div(M, TILE_M) && blockIdx.y < ceil_div(N, TILE_N)) {
+
     // 각 warp는 16×8×16 타일 하나를 수행한다고 가정
     float D[4], C[4];
-    half  A[8], B[4];
+    
 
     // 초기화: A, B 전부 1.0, C는 0.0
-    for (int i = 0; i < 8; ++i)  A[i] = __float2half(1.0f);
-    for (int i = 0; i < 4; ++i)  B[i] = __float2half(1.0f);
-    for (int i = 0; i < 4; ++i)  C[i] = 0.0f;
+   for (int i = 0; i < 4; ++i)  C[i] = 0.0f;
 
     mma_m16n8k16_f16(D, A, B, C);
 
@@ -48,15 +55,34 @@ __global__ void test_mma_kernel(half *out) {
     if (threadIdx.x == 0)
         for (int i = 0; i < 4; ++i)
             out[i] = __float2half(D[i]); // fp32 누적, fp16으로 변환 
+    }
+
 }
 
 // --- 3. main --------------------------------------------------------------
 int main() {
-    half *d_out, h_out[4];
-    cudaMalloc(&d_out, sizeof(half) * 4);
+    int M = 32, N = 16, K = 16; // 타일 크기
 
-    test_mma_kernel<<<1, 32>>>(d_out);
-    cudaMemcpy(h_out, d_out, sizeof(half) * 4, cudaMemcpyDeviceToHost);
+    half *d_A, *d_B, *d_out;
+    cudaMalloc(&d_A, sizeof(half)*M*K);
+    cudaMalloc(&d_B, sizeof(half)*K*N);
+    cudaMalloc(&d_out, sizeof(half)*M*N);
+
+    // 호스트에서 초기화 후 디바이스로 복사
+    half *hA = new half[M*K];
+    half *hB = new half[K*N];
+    for (int i=0;i<M*K;++i) hA[i] = __float2half(1.0f);
+    for (int i=0;i<K*N;++i) hB[i] = __float2half(1.0f);
+    cudaMemcpy(d_A, hA, sizeof(hA)*K*M, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, hB, sizeof(hB)*K*N, cudaMemcpyHostToDevice);
+
+    dim3 grid(ceil_div(N, TILE_N), ceil_div(M, TILE_M));  // x: 타일 N방향, y: 타일 M방향
+    dim3 block(32, 1, 1);   
+    test_mma_kernel<<<grid, block>>>(d_A, d_B, d_out, M, N, K);
+    cudaDeviceSynchronize();
+
+    half* h_out = new half[M*N];
+    cudaMemcpy(h_out, d_out, sizeof(half) * M*N, cudaMemcpyDeviceToHost);
 
     for (int i = 0; i < 4; ++i)
         printf("D[%d] = %f\n", i, __half2float(h_out[i]));
