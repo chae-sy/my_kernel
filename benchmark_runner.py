@@ -1,13 +1,11 @@
 import torch
 import time
 import runner
+print(dir(runner))
 
 torch.manual_seed(0)
 
-# ============================================================
-# 1. 설정
-# ============================================================
-M = N = K = 256
+M = N = K = 4096
 WARMUP = 100
 REPS = 100
 
@@ -16,17 +14,12 @@ B = torch.randn(K, N, dtype=torch.float16, device='cuda')
 C0 = torch.zeros(M, N, dtype=torch.float16, device='cuda')
 C1 = torch.zeros_like(C0)
 C2 = torch.zeros_like(C0)
+C3 = torch.zeros_like(C0)
 
-# ============================================================
-# 2. 헬퍼 함수
-# ============================================================
-def run_benchmark(fn, label):
-    # warm-up
+def run_benchmark(fn):
     for _ in range(WARMUP):
         fn()
     torch.cuda.synchronize()
-
-    # measure
     times = []
     for _ in range(REPS):
         torch.cuda.synchronize()
@@ -34,10 +27,8 @@ def run_benchmark(fn, label):
         fn()
         torch.cuda.synchronize()
         t1 = time.time()
-        times.append((t1 - t0) * 1000)  # ms
-
-    avg_ms = sum(times) / len(times)
-    return avg_ms
+        times.append((t1 - t0) * 1000)
+    return sum(times) / len(times)
 
 def compare(C_ref, C_test):
     diff = (C_ref - C_test).float()
@@ -46,48 +37,45 @@ def compare(C_ref, C_test):
     mism = (diff.abs() > 5e-2).sum().item()
     return max_abs, mean_abs, mism
 
-GFLOPs = 2 * M * N * K / 1e9  # for 1 iteration
+GFLOPs = 2 * M * N * K / 1e9
 
-# ============================================================
-# 3. 워밍업 후 성능 측정
-# ============================================================
 print(f"\n=== Benchmark: M={M}, N={N}, K={K} ===")
 print(f"Warm-up {WARMUP} iters, Measure {REPS} iters\n")
 
-# --- torch.matmul ---
-t_torch = run_benchmark(lambda: torch.matmul(A, B), "torch.matmul")
+# torch.matmul
+t_torch = run_benchmark(lambda: torch.matmul(A, B.T))
 C_ref = torch.matmul(A, B.T)
 
-# --- kernel 1.0 ---
-t_10 = run_benchmark(lambda: runner.mma_matmul_1_0(A, B, C1), "mma_matmul_1_0")
+# matmul_0_1
+#t_01 = run_benchmark(lambda: runner.matmul_0_1(A, B, C0))
 
-# --- kernel 1.1 ---
-t_11 = run_benchmark(lambda: runner.mma_matmul_1_1(A, B, C2), "mma_matmul_1_1")
+# mma kernels
+t_10 = run_benchmark(lambda: runner.mma_matmul_1_0(A, B, C1))
+t_11 = run_benchmark(lambda: runner.mma_matmul_1_1(A, B, C2))
 
-# ============================================================
-# 4. 정확도 및 성능 계산
-# ============================================================
-max0, mean0, mism0 = compare(C_ref, C1)
-max1, mean1, mism1 = compare(C_ref, C2)
+max01, mean01, mism01 = compare(C_ref, C0)
+max10, mean10, mism10 = compare(C_ref, C1)
+max11, mean11, mism11 = compare(C_ref, C2)
 
 gflops_torch = GFLOPs / (t_torch / 1e3)
+#gflops_01 = GFLOPs / (t_01 / 1e3)
 gflops_10 = GFLOPs / (t_10 / 1e3)
 gflops_11 = GFLOPs / (t_11 / 1e3)
 
+#r01 = 100 * gflops_01 / gflops_torch
 r10 = 100 * gflops_10 / gflops_torch
 r11 = 100 * gflops_11 / gflops_torch
 
-# ============================================================
-# 5. 결과 출력
-# ============================================================
-print("=== Accuracy ===")
-print(f"[mma_matmul_1_0] max abs diff {max0:.6f}, mean abs diff {mean0:.6f}, mismatches {mism0}")
-print(f"[mma_matmul_1_1] max abs diff {max1:.6f}, mean abs diff {mean1:.6f}, mismatches {mism1}")
+print(f"=== Accuracy ===")
+print(f"[matmul_0_1]  max {max01:.6f}, mean {mean01:.6f}, mism {mism01}")
+print(f"[mma_matmul_1_0]  max {max10:.6f}, mean {mean10:.6f}, mism {mism10}")
+print(f"[mma_matmul_1_1]  max {max11:.6f}, mean {mean11:.6f}, mism {mism11}")
 
 print(f"\n=== Performance (avg of {REPS} runs after {WARMUP} warmup) ===")
 print(f"{'Kernel':<15} {'Time (ms)':>12} {'GFLOP/s':>12} {'Rel. Perf':>12}")
 print(f"{'-'*55}")
 print(f"{'torch.matmul':<15} {t_torch:>12.4f} {gflops_torch:>12.2f} {'100.00%':>12}")
+#print(f"{'matmul_0_1':<15} {t_01:>12.4f} {gflops_01:>12.2f} {r01:>11.2f}%")
 print(f"{'mma_matmul_1_0':<15} {t_10:>12.4f} {gflops_10:>12.2f} {r10:>11.2f}%")
 print(f"{'mma_matmul_1_1':<15} {t_11:>12.4f} {gflops_11:>12.2f} {r11:>11.2f}%")
 

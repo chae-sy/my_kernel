@@ -22,6 +22,22 @@
 
 #include "kernel.h"
 
+// PyTorch binding wrapper
+void launch_matmul_0_1(torch::Tensor A, torch::Tensor B, torch::Tensor C) {
+    const int M = A.size(0);
+    const int K = A.size(1);
+    const int N = B.size(1);
+
+    dim3 block(16, 16);
+    dim3 grid((N + block.x - 1) / block.x,
+              (M + block.y - 1) / block.y);
+
+    matmul_0_1<<<grid, block>>>(
+        reinterpret_cast<half *>(A.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(B.data_ptr<at::Half>()),
+        reinterpret_cast<half *>(C.data_ptr<at::Half>()),
+        M, N, K);
+}
 
 void mma_matmul_1_0_launcher(torch::Tensor A, torch::Tensor B, torch::Tensor C) {
     int M = A.size(0);
@@ -55,6 +71,7 @@ void mma_matmul_1_1_launcher(torch::Tensor A, torch::Tensor B, torch::Tensor C) 
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("matmul_0_1", &launch_matmul_0_1, "Naive matmul");
     m.def("mma_matmul_1_0", &mma_matmul_1_0_launcher, "MMA kernel 1.0");
     m.def("mma_matmul_1_1", &mma_matmul_1_1_launcher, "MMA kernel 1.1");
 }
