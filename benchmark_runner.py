@@ -56,7 +56,7 @@ print(f"Warm-up {WARMUP} iters, Measure {REPS} iters\n")
 
 # --- torch.matmul ---
 t_torch = run_benchmark(lambda: torch.matmul(A, B), "torch.matmul")
-C_ref = torch.matmul(A, B)
+C_ref = torch.matmul(A, B.T)
 
 # --- kernel 1.0 ---
 t_10 = run_benchmark(lambda: runner.mma_matmul_1_0(A, B, C1), "mma_matmul_1_0")
