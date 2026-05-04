@@ -1,1 +1,3 @@
 # My Kernel
+
+CUDA practices
